@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/dto"
@@ -20,6 +22,9 @@ import (
 )
 
 func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types.NewAPIError) {
+	startTime := time.Now()
+	logger.LogInfo(c, "#ImageHelper#start, tokenId:"+string(info.TokenId)+", userId:"+string(info.UserId))
+
 	info.InitChannelMeta(c)
 
 	imageReq, ok := info.Request.(*dto.ImageRequest)
@@ -31,6 +36,8 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 	if err != nil {
 		return types.NewError(fmt.Errorf("failed to copy request to ImageRequest: %w", err), types.ErrorCodeInvalidRequest, types.ErrOptionWithSkipRetry())
 	}
+	deepCopyTime := time.Now()
+	logger.LogInfo(c, "#ImageHelper#deep copy, tokenId:"+string(info.TokenId)+", userId:"+string(info.UserId)+", timeCost:"+(deepCopyTime.Sub(startTime)/1000).String())
 
 	err = helper.ModelMappedHelper(c, info, request)
 	if err != nil {
@@ -83,7 +90,12 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 
 	statusCodeMappingStr := c.GetString("status_code_mapping")
 
+	requestStartTime := time.Now()
+	logger.LogInfo(c, "#ImageHelper#start request, tokenId:"+string(info.TokenId)+", userId:"+string(info.UserId)+", timeCost:"+(requestStartTime.Sub(deepCopyTime)/1000).String())
 	resp, err := adaptor.DoRequest(c, info, requestBody)
+	requestEndTime := time.Now()
+	logger.LogInfo(c, "#ImageHelper#end request, tokenId:"+string(info.TokenId)+", userId:"+string(info.UserId)+", timeCost:"+(requestEndTime.Sub(requestStartTime)/1000).String())
+
 	if err != nil {
 		return types.NewOpenAIError(err, types.ErrorCodeDoRequestFailed, http.StatusInternalServerError)
 	}
@@ -118,12 +130,82 @@ func ImageHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *type
 		quality = "hd"
 	}
 
-	var logContent string
+	dealRespTime := time.Now()
+	logger.LogInfo(c, "#ImageHelper#deal resp, tokenId:"+string(info.TokenId)+", userId:"+string(info.UserId)+", timeCost:"+(dealRespTime.Sub(requestEndTime)/1000).String())
 
+	var logContent string
 	if len(request.Size) > 0 {
 		logContent = fmt.Sprintf("大小 %s, 品质 %s, 张数 %d", request.Size, quality, request.N)
+
+		// 添加图片张数和大小信息
+		imageCount, imageSizeInfo := getImageCountAndSizeInfo(c)
+		if imageCount > 0 {
+			logContent += fmt.Sprintf(", 输入图片 %d 张", imageCount)
+			if imageSizeInfo != "" {
+				logContent += fmt.Sprintf(" (%s)", imageSizeInfo)
+			}
+		}
 	}
 
 	postConsumeQuota(c, info, usage.(*dto.Usage), logContent)
 	return nil
+}
+
+// getImageCountAndSizeInfo 获取图片张数和大小信息
+func getImageCountAndSizeInfo(c *gin.Context) (int, string) {
+	mf := c.Request.MultipartForm
+	if mf == nil {
+		if _, err := c.MultipartForm(); err != nil {
+			return 0, ""
+		}
+		mf = c.Request.MultipartForm
+	}
+
+	var imageFiles []*multipart.FileHeader
+	var exists bool
+
+	// First check for standard "image" field
+	if imageFiles, exists = mf.File["image"]; !exists || len(imageFiles) == 0 {
+		// If not found, check for "image[]" field
+		if imageFiles, exists = mf.File["image[]"]; !exists || len(imageFiles) == 0 {
+			// If still not found, iterate through all fields to find any that start with "image["
+			foundArrayImages := false
+			for fieldName, files := range mf.File {
+				if strings.HasPrefix(fieldName, "image[") && len(files) > 0 {
+					foundArrayImages = true
+					imageFiles = append(imageFiles, files...)
+				}
+			}
+
+			// If no image fields found at all
+			if !foundArrayImages && (len(imageFiles) == 0) {
+				return 0, ""
+			}
+		}
+	}
+
+	if len(imageFiles) == 0 {
+		return 0, ""
+	}
+
+	// 计算图片大小信息
+	var totalSize int64
+	var sizeInfo string
+
+	for _, file := range imageFiles {
+		totalSize += file.Size
+	}
+
+	// 格式化大小信息
+	if totalSize > 0 {
+		if totalSize < 1024 {
+			sizeInfo = fmt.Sprintf("%d B", totalSize)
+		} else if totalSize < 1024*1024 {
+			sizeInfo = fmt.Sprintf("%.1f KB", float64(totalSize)/1024)
+		} else {
+			sizeInfo = fmt.Sprintf("%.1f MB", float64(totalSize)/(1024*1024))
+		}
+	}
+
+	return len(imageFiles), sizeInfo
 }
